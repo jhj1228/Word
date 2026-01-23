@@ -1,0 +1,15 @@
+{
+    "name": "kkutu-word-updater",
+    "version": "1.0.0",
+    "description": "국립국어원 표준국어대사전 API를 이용한 단어 뜻 자동 업데이트 스크립트",
+    "main": "update_definitions.js",
+    "scripts": {
+        "start": "node update_definitions.js"
+    },
+    "dependencies": {
+        "axios": "^1.6.0",
+        "pg": "^8.11.0"
+    },
+    "author": "",
+    "license": "ISC"
+}
