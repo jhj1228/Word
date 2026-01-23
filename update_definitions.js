@@ -1,22 +1,18 @@
-const { Client } = require('pg');
-const axios = require('axios');
+const { Pool } = require('pg');
+const fs = require('fs');
 
-// --- 설정 부분 ---
 const DB_CONFIG = {
-    user: 'your_username',
+    user: 'your_user',
     host: 'your_host',
     database: 'your_database',
     password: 'your_password',
     port: 5432,
+    max: 20,
 };
 
-const API_KEY_ST = 'your_api_key_here';
-const API_URL_ST = 'https://stdict.korean.go.kr/api/search.do';
+const JSON_FILE_PATH = 'your_file_path';
 
-const API_KEY_OURMAL = 'your_api_key_here';
-const API_URL_OURMAL = 'https://opendict.korean.go.kr/api/search';
-
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const BATCH_SIZE = 1000;
 
 function cleanWord(text) {
     if (!text) return "";
@@ -26,6 +22,7 @@ function cleanWord(text) {
 function formatSubDefinitions(text) {
     if (!text) return "";
     let formatted = text.trim();
+    formatted = formatted.replace(/[\u0000-\u001F]/g, '');
     const circledMap = { '①': 1, '②': 2, '③': 3, '④': 4, '⑤': 5, '⑥': 6, '⑦': 7, '⑧': 8, '⑨': 9, '⑩': 10 };
     for (const [char, num] of Object.entries(circledMap)) {
         formatted = formatted.split(char).join(`（${num}）`);
@@ -37,112 +34,135 @@ function formatSubDefinitions(text) {
     return formatted;
 }
 
-function processResultData(items) {
-    if (!items || items.length === 0) return null;
-    const formattedItems = items.map((item, index) => {
-        const topIndex = index + 1;
-        const rawDefinition = (item.sense && item.sense.definition) ? item.sense.definition : "";
-        const subDefinition = formatSubDefinitions(rawDefinition);
-        return `＂${topIndex}＂［1］${subDefinition}`;
-    });
-    return formattedItems.join('');
-}
-
-async function fetchFromApi(word, apiKey, apiUrl, method, apiName) {
-    const searchWord = cleanWord(word);
-    try {
-        const params = {
-            key: apiKey,
-            q: searchWord,
-            req_type: 'json',
-            advanced: 'y',
-            method: method,
-            target: 1,
-            type1: 'word',
-            num: 100
-        };
-
-        const response = await axios.get(apiUrl, { params: params, timeout: 5000 });
-
-        if (response.status === 200 && response.data && response.data.channel) {
-            const items = response.data.channel.item;
-            if (!items || items.length === 0) return null;
-
-            const targetClean = cleanWord(word);
-            const matchedItems = items.filter(item => cleanWord(item.word) === targetClean);
-
-            if (matchedItems.length > 0) {
-                return processResultData(matchedItems);
-            }
+function extractDefinitions(obj, results = []) {
+    if (!obj) return results;
+    if (Array.isArray(obj)) {
+        obj.forEach(item => extractDefinitions(item, results));
+    } else if (typeof obj === 'object') {
+        if (obj.definition) {
+            results.push(obj.definition);
         }
-    } catch (e) {
+        Object.values(obj).forEach(value => {
+            if (typeof value === 'object') {
+                extractDefinitions(value, results);
+            }
+        });
     }
-    return null;
+    return results;
 }
 
-async function getDefinition(word) {
-    let result = null;
+function processJsonData(jsonData) {
+    console.log("데이터 구조 분석 및 가공 중...");
+    let items = [];
+    if (Array.isArray(jsonData)) items = jsonData;
+    else if (jsonData.channel && Array.isArray(jsonData.channel.item)) items = jsonData.channel.item;
+    else {
+        console.error("데이터 배열을 찾을 수 없습니다.");
+        return [];
+    }
 
-    // 표국대
-    result = await fetchFromApi(word, API_KEY_ST, API_URL_ST, 'exact', '표국대-Exact');
-    if (result) return result;
+    const wordMap = new Map();
 
-    result = await fetchFromApi(word, API_KEY_ST, API_URL_ST, 'include', '표국대-Include');
-    if (result) return result;
+    items.forEach((item) => {
+        let rawWord = "";
+        if (item.word_info && item.word_info.word) rawWord = item.word_info.word;
+        else if (item.word) rawWord = item.word;
 
-    // 우리말샘
-    result = await fetchFromApi(word, API_KEY_OURMAL, API_URL_OURMAL, 'exact', '우리말샘-Exact');
-    if (result) return result;
+        if (!rawWord) return;
 
-    result = await fetchFromApi(word, API_KEY_OURMAL, API_URL_OURMAL, 'include', '우리말샘-Include');
-    if (result) return result;
+        const cleanKey = cleanWord(rawWord);
+        if (!cleanKey) return;
 
-    return null;
+        const definitions = extractDefinitions(item.word_info);
+        if (definitions.length === 0) return;
+
+        if (!wordMap.has(cleanKey)) {
+            wordMap.set(cleanKey, []);
+        }
+
+        definitions.forEach(def => {
+            const formatted = formatSubDefinitions(def);
+            if (!wordMap.get(cleanKey).includes(formatted)) {
+                wordMap.get(cleanKey).push(formatted);
+            }
+        });
+    });
+
+    const resultList = [];
+    for (const [word, definitions] of wordMap) {
+        const combinedMean = definitions.map((def, idx) => {
+            const topIndex = idx + 1;
+            return `＂${topIndex}＂［1］${def}`;
+        }).join('');
+
+        resultList.push({
+            id: word,
+            mean: combinedMean
+        });
+    }
+
+    console.log(`중복 제거 후 ${resultList.length}개의 단어 준비 완료.`);
+    return resultList;
 }
 
-async function updateDatabase() {
-    const client = new Client(DB_CONFIG);
+async function insertDataToDb() {
+    if (!fs.existsSync(JSON_FILE_PATH)) {
+        console.error(`파일 없음: ${JSON_FILE_PATH}`);
+        return;
+    }
+
+    const pool = new Pool(DB_CONFIG);
+
     try {
-        await client.connect();
-        console.log("데이터베이스 연결됨");
-        const selectQuery = `
-            SELECT _id 
-            FROM public.kkutu_ko 
-            WHERE (mean IS NULL OR mean = '' OR mean = '＂1＂［1］（1）')
-              AND type != 'INJEONG'
-            ORDER BY RANDOM()
-        `;
+        console.log(`JSON 파일 읽는 중...`);
+        const rawData = fs.readFileSync(JSON_FILE_PATH, 'utf8');
+        const jsonData = JSON.parse(rawData);
 
-        const res = await client.query(selectQuery);
-        const words = res.rows;
-        const total = words.length;
+        const processedList = processJsonData(jsonData);
 
-        console.log(`총 ${total}개의 '뜻 없는' 단어 작업을 시작합니다. (무작위 순서)`);
+        if (processedList.length === 0) {
+            console.log("저장할 데이터가 없습니다.");
+            return;
+        }
+
+        console.log(`DB 입력 시작 (총 ${processedList.length}개)...`);
 
         let successCount = 0;
-        for (let i = 0; i < total; i++) {
-            const word = words[i]._id;
-            const definition = await getDefinition(word);
 
-            if (definition) {
-                const updateQuery = "UPDATE public.kkutu_ko SET mean = $1 WHERE _id = $2";
-                await client.query(updateQuery, [definition, word]);
-                successCount++;
-                console.log(`[${i + 1}/${total}] 성공: '${word}'`);
-            } else {
-                // console.log(`[${i + 1}/${total}] 실패: '${word}' (검색 결과 없음)`);
+        for (let i = 0; i < processedList.length; i += BATCH_SIZE) {
+            const batch = processedList.slice(i, i + BATCH_SIZE);
+
+            const query = `
+                INSERT INTO public.kkutu_ko (_id, mean, type)
+                VALUES 
+                ${batch.map((_, idx) => `($${idx * 2 + 1}, $${idx * 2 + 2}, 'DQ')`).join(', ')}
+                ON CONFLICT (_id) 
+                DO UPDATE SET mean = EXCLUDED.mean
+            `;
+
+            const values = [];
+            batch.forEach(item => {
+                values.push(item.id);
+                values.push(item.mean);
+            });
+
+            await pool.query(query, values);
+
+            successCount += batch.length;
+
+            if (i === 0 || i % (BATCH_SIZE * 5) === 0) {
+                const percent = ((successCount / processedList.length) * 100).toFixed(1);
+                console.log(`진행률: ${percent}% (${successCount}/${processedList.length})`);
             }
-
-            // 딜레이
-            await delay(150);
         }
-        console.log(`작업 완료. ${successCount}개 업데이트됨.`);
+
+        console.log(`\n작업 완료! 총 ${successCount}개 처리됨.`);
 
     } catch (err) {
-        console.error("DB 오류:", err);
+        console.error("오류 발생:", err);
     } finally {
-        await client.end();
+        await pool.end();
     }
 }
 
-updateDatabase();
+insertDataToDb();
