@@ -69,7 +69,7 @@ public class ImageViewer extends JFrame {
 		desclabel = new JLabel("주소");
 		rightpanel.add(desclabel);
 
-		// 이미지 밝기 조절 (슬라이드로 조절, 최초값 50)
+		// 이미지 밝기 조절 (슬라이드로 조절, 최초값 0)
 		JSlider bSlider = new JSlider(-100, 100, 0);
 		rightpanel.add(bSlider);
 		bSlider.addChangeListener(new ChangeListener() {
